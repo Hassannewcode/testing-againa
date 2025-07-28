@@ -1,0 +1,287 @@
+package com.example.motiontracker
+
+import android.Manifest
+import android.graphics.Rect
+import android.os.Bundle
+import android.util.Size
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ExperimentalGetImage
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
+import com.google.accompanist.permissions.ExperimentalPermissionsApi
+import com.google.accompanist.permissions.isGranted
+import com.google.accompanist.permissions.rememberPermissionState
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.objects.DetectedObject
+import com.google.mlkit.vision.objects.ObjectDetection
+import com.google.mlkit.vision.objects.defaults.ObjectDetectorOptions
+import com.example.motiontracker.ui.theme.MotionTrackerTheme
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.launch
+import java.util.concurrent.Executors
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            MotionTrackerTheme(darkTheme = true) {
+                MotionTrackerApp()
+            }
+        }
+    }
+}
+
+/**
+ * Data class to hold the complete result of an object detection analysis.
+ * @param objects The list of detected objects with all their metadata.
+ * @param sourceImageWidth The width of the image that was analyzed.
+ * @param sourceImageHeight The height of the image that was analyzed.
+ */
+private data class DetectionResult(
+    val objects: List<DetectedObject>,
+    val sourceImageWidth: Int,
+    val sourceImageHeight: Int
+)
+
+/**
+ * The main composable that handles permissions and displays the correct UI.
+ */
+@OptIn(ExperimentalPermissionsApi::class)
+@Composable
+private fun MotionTrackerApp() {
+    val cameraPermissionState = rememberPermissionState(permission = Manifest.permission.CAMERA)
+
+    LaunchedEffect(Unit) {
+        if (!cameraPermissionState.status.isGranted) {
+            cameraPermissionState.launchPermissionRequest()
+        }
+    }
+
+    if (cameraPermissionState.status.isGranted) {
+        CameraWithHud()
+    } else {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text(
+                text = "Camera permission is required.",
+                color = MaterialTheme.colorScheme.onBackground
+            )
+        }
+    }
+}
+
+/**
+ * The core component that displays the camera feed and the intelligent HUD overlay.
+ */
+@Composable
+@OptIn(ExperimentalGetImage::class)
+private fun CameraWithHud() {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var detectionResult by remember { mutableStateOf<DetectionResult?>(null) }
+    val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
+
+    val scanlinePosition = remember { Animatable(0f) }
+    LaunchedEffect(Unit) {
+        scanlinePosition.animateTo(
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(tween(durationMillis = 3000, easing = LinearEasing))
+        )
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            cameraExecutor.shutdown()
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { ctx ->
+                val previewView = PreviewView(ctx)
+                val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
+
+                cameraProviderFuture.addListener({
+                    val cameraProvider = cameraProviderFuture.get()
+                    val preview = Preview.Builder().build().also { previewBuilder ->
+                        previewBuilder.setSurfaceProvider(previewView.surfaceProvider)
+                    }
+
+                    val imageAnalysis = ImageAnalysis.Builder()
+                        .setTargetResolution(Size(1280, 720))
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .build()
+                        .also { analysisBuilder ->
+                            analysisBuilder.setAnalyzer(cameraExecutor, ObjectAnalyzer { objects, width, height ->
+                                detectionResult = DetectionResult(objects, width, height)
+                            })
+                        }
+
+                    try {
+                        cameraProvider.unbindAll()
+                        cameraProvider.bindToLifecycle(
+                            lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageAnalysis
+                        )
+                    } catch (e: Exception) {
+                        // Handle camera binding errors appropriately, e.g., log or show a message
+                    }
+                }, ContextCompat.getMainExecutor(ctx))
+                previewView
+            }
+        )
+
+        HudOverlay(
+            detectionResult = detectionResult,
+            scanlinePosition = scanlinePosition.value
+        )
+
+        Text(
+            text = "AI TRACKING ACTIVE",
+            color = Color.Cyan,
+            fontSize = 18.sp,
+            modifier = Modifier.align(Alignment.TopStart).padding(16.dp)
+        )
+    }
+}
+
+@Composable
+private fun HudOverlay(detectionResult: DetectionResult?, scanlinePosition: Float) {
+    val textMeasurer = rememberTextMeasurer()
+
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        // Draw the animated scanline
+        val y = scanlinePosition * size.height
+        drawLine(
+            color = Color.Cyan.copy(alpha = 0.4f),
+            start = Offset(0f, y),
+            end = Offset(size.width, y),
+            strokeWidth = 6.dp.toPx()
+        )
+
+        detectionResult?.let { result ->
+            // This is the crucial coordinate transformation part.
+            // It scales the coordinates from the analysis image to the screen's canvas.
+            val scaleX = size.width / result.sourceImageHeight.toFloat()
+            val scaleY = size.height / result.sourceImageWidth.toFloat()
+
+            result.objects.forEach { obj ->
+                val box = obj.boundingBox
+                val boxLeft = box.left * scaleX
+                val boxTop = box.top * scaleY
+                val boxRight = box.right * scaleX
+                val boxBottom = box.bottom * scaleY
+
+                // Draw stylish corner brackets instead of a full box
+                val cornerLength = 20.dp.toPx()
+                val strokeWidth = 2.dp.toPx()
+                // Top-left
+                drawLine(Color.Cyan, Offset(boxLeft, boxTop), Offset(boxLeft + cornerLength, boxTop), strokeWidth)
+                drawLine(Color.Cyan, Offset(boxLeft, boxTop), Offset(boxLeft, boxTop + cornerLength), strokeWidth)
+                // Top-right
+                drawLine(Color.Cyan, Offset(boxRight, boxTop), Offset(boxRight - cornerLength, boxTop), strokeWidth)
+                drawLine(Color.Cyan, Offset(boxRight, boxTop), Offset(boxRight, boxTop + cornerLength), strokeWidth)
+                // Bottom-left
+                drawLine(Color.Cyan, Offset(boxLeft, boxBottom), Offset(boxLeft + cornerLength, boxBottom), strokeWidth)
+                drawLine(Color.Cyan, Offset(boxLeft, boxBottom), Offset(boxLeft, boxBottom - cornerLength), strokeWidth)
+                // Bottom-right
+                drawLine(Color.Cyan, Offset(boxRight, boxBottom), Offset(boxRight - cornerLength, boxBottom), strokeWidth)
+                drawLine(Color.Cyan, Offset(boxRight, boxBottom), Offset(boxRight, boxBottom - cornerLength), strokeWidth)
+
+                // Prepare and draw the classification text
+                val label = obj.labels.firstOrNull()
+                val infoText = if (label != null) {
+                    "ID: ${obj.trackingId ?: "N/A"}\n${label.text} (${(label.confidence * 100).toInt()}%)"
+                } else {
+                    "ID: ${obj.trackingId ?: "N/A"}\nUnknown"
+                }
+
+                drawText(
+                    textMeasurer = textMeasurer,
+                    text = infoText,
+                    topLeft = Offset(boxLeft, boxBottom + 4.dp.toPx()),
+                    style = TextStyle(color = Color.Cyan, fontSize = 14.sp)
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Analyzes camera frames to detect and classify objects using ML Kit.
+ */
+private class ObjectAnalyzer(
+    private val onResult: (List<DetectedObject>, Int, Int) -> Unit
+) : ImageAnalysis.Analyzer {
+
+    private val options = ObjectDetectorOptions.Builder()
+        .setDetectorMode(ObjectDetectorOptions.STREAM_MODE)
+        .enableMultipleObjects()
+        .enableClassification() // This is key to getting object labels
+        .build()
+    private val objectDetector = ObjectDetection.getClient(options)
+    private val coroutineScope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
+
+    @ExperimentalGetImage
+    override fun analyze(imageProxy: androidx.camera.core.ImageProxy) {
+        val mediaImage = imageProxy.image ?: run { imageProxy.close(); return }
+        val inputImage = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+
+        // In portrait mode, the analysis image is rotated 90 degrees, so width/height are swapped.
+        val (imageWidth, imageHeight) = if (imageProxy.imageInfo.rotationDegrees % 180 != 0) {
+            Pair(inputImage.height, inputImage.width)
+        } else {
+            Pair(inputImage.width, inputImage.height)
+        }
+
+        coroutineScope.launch {
+            val result = suspendCoroutine { continuation ->
+                objectDetector.process(inputImage)
+                    .addOnSuccessListener { detectedObjects -> continuation.resume(detectedObjects) }
+                    .addOnFailureListener { continuation.resume(null) } // Resume with null on failure
+                    .addOnCompleteListener { imageProxy.close() }
+            }
+
+            result?.let {
+                onResult(it, imageWidth, imageHeight)
+            }
+        }
+    }
+}
+
